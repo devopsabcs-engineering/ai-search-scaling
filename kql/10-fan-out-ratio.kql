@@ -1,0 +1,85 @@
+// =============================================================================
+// 10-fan-out-ratio.kql
+// Proves the seven-times per-turn query amplification.
+// =============================================================================
+//
+// RUN THE DISCOVERY QUERIES FIRST
+//   00-discover-dependency-types.kql and 01-discover-search-diagnostic-shape.kql.
+//   If 01 shows different column names than those used below (for example
+//   ResultSignature instead of resultSignature_d, or an absent IndexName_s),
+//   substitute the names it reports before trusting this result.
+//
+// PURPOSE
+//   Show, per minute, how many Search queries were issued against how many
+//   distinct indexes. The agent has seven knowledge sources attached, and
+//   Copilot Studio does not route among knowledge sources by description below
+//   25 sources, so every user turn fans out to all seven. This query is the
+//   evidence for that claim.
+//
+// WHY IT MATTERS
+//   Every limit in this architecture is multiplied by seven: semantic ranker
+//   concurrency, connector call rate, APIM quota, token volume. Capacity
+//   purchases defer the failure; reducing fan-out removes it. Quantifying the
+//   multiplier is what turns "reduce your fan-out" from advice into a costed
+//   decision.
+//   Research: .copilot-tracking/research/2026-09-22/ai-search-scaling-206-403-rca-research.md
+//             Lines 164-175 (D7, the 25-source threshold), Lines 203-253 (Scenario 1)
+//
+// TARGET TABLE
+//   AzureDiagnostics, ResourceProvider == "MICROSOFT.SEARCH".
+//
+// PREREQUISITES
+//   * Search diagnostic setting sending OperationLogs to this workspace.
+//   Enable with: scripts/Enable-DiagnosticSettings.ps1
+//
+// HEALTHY VS UNHEALTHY
+//   Expected here : DistinctIndexes settles at 7 and QueriesPerIndex tracks the
+//                   user-turn rate closely. That is the fan-out, confirmed.
+//   Healthy target: after consolidation or a move to Tools, DistinctIndexes per
+//                   turn drops toward 1 or 2 and TotalQueries falls with it.
+//   Unhealthy     : TotalQueries spikes while DistinctIndexes stays flat at 7,
+//                   which means concurrent turns are stacking on the same seven
+//                   indexes. Cross-reference with 12-semantic-capacity-headroom.kql.
+//
+// NOTE ON THE METRIC
+//   QueriesPerIndex is the honest fan-out signal: it is the mean queries landing
+//   on each index in the bin. Reading it alongside DistinctIndexes tells you
+//   whether volume growth came from more turns or from more indexes per turn.
+//
+// Derived from Q1b-FanOutRatio,
+//   .copilot-tracking/research/2026-09-22/ai-search-scaling-206-403-rca-research.md Lines 276-291
+// =============================================================================
+
+let lookback = 24h;
+let bucket = 1m;
+AzureDiagnostics
+| where TimeGenerated > ago(lookback)
+| where ResourceProvider == "MICROSOFT.SEARCH"
+| where OperationName == "Query.Search"
+| summarize
+    TotalQueries    = count(),
+    DistinctIndexes = dcount(IndexName_s),
+    QueriesPerIndex = round(count() * 1.0 / todouble(dcount(IndexName_s)), 2)
+    by bin(TimeGenerated, bucket)
+| render timechart with (ytitle = "Queries and distinct indexes per minute")
+
+// -----------------------------------------------------------------------------
+// COMPANION: per-index profile
+// Which of the seven indexes carries the load, and which is the slow one.
+// Run this when the chart above shows uneven pressure.
+// -----------------------------------------------------------------------------
+// let lookback = 24h;
+// AzureDiagnostics
+// | where TimeGenerated > ago(lookback)
+// | where ResourceProvider == "MICROSOFT.SEARCH"
+// | where OperationName in ("Query.Search", "Query.Suggest", "Query.Lookup", "Query.Autocomplete")
+// | summarize
+//     Queries      = count(),
+//     AvgDocs      = round(avg(Documents_d), 1),
+//     AvgMs        = round(avg(DurationMs), 1),
+//     P95Ms        = round(percentile(DurationMs, 95), 1),
+//     P99Ms        = round(percentile(DurationMs, 99), 1),
+//     Failures     = countif(toint(resultSignature_d) >= 400)
+//     by IndexName_s
+// | extend FailurePct = round(100.0 * Failures / Queries, 2)
+// | order by Queries desc

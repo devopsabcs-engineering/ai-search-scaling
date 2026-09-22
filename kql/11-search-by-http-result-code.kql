@@ -1,0 +1,110 @@
+// =============================================================================
+// 11-search-by-http-result-code.kql
+// Buckets Search-side outcomes so 206, 403, 429, and 503 are separable.
+// =============================================================================
+//
+// RUN THE DISCOVERY QUERIES FIRST
+//   00-discover-dependency-types.kql and 01-discover-search-diagnostic-shape.kql.
+//   Section 3 of file 01 decides whether the 206 bucket below can ever populate.
+//   If your workspace reports different column names, substitute them here.
+//
+// PURPOSE
+//   Split every query-side Search operation by HTTP status over time, keeping
+//   the four failure modes distinct because they mean four different things:
+//     206  semantic ranker at capacity, partial results returned
+//     403  authorization or network policy denial, NOT quota and NOT storage
+//     429  request throttled
+//     503  service throttled or unavailable
+//
+// WHY THE DISTINCTION MATTERS
+//   Azure AI Search never returns 403 for quota or for storage exhaustion.
+//   Semantic free-plan exhaustion returns 402. So a 403 here is an auth, RBAC,
+//   or firewall problem and belongs to a completely separate workstream from
+//   the 206s. Bucketing them together hides that.
+//   Zero 429s is the expected result for this workload rather than evidence
+//   against resource constraint: the semantic ranker signals capacity pressure
+//   with 206, not with 429.
+//   Research: .copilot-tracking/research/2026-09-22/ai-search-scaling-206-403-rca-research.md
+//             Lines 126-137 (D4, why no 429s), Lines 142-163 (D6, what 403 means)
+//
+// TARGET TABLE
+//   AzureDiagnostics, ResourceProvider == "MICROSOFT.SEARCH".
+//
+// PREREQUISITES
+//   * Search diagnostic setting sending OperationLogs to this workspace.
+//   Enable with: scripts/Enable-DiagnosticSettings.ps1
+//
+// UNVERIFIED ASSUMPTION (open item U6)
+//   No Microsoft sample confirms that Search writes 206 into resultSignature_d.
+//   The 206 bucket below is therefore UNVERIFIED. If file 01 section 3 returns
+//   no 206 rows, this query cannot detect semantic partial responses at all and
+//   21-apim-206-semantic-partial-capture.kql is the only route to them.
+//
+// HEALTHY VS UNHEALTHY
+//   Healthy   : effectively all traffic in the 200 bucket.
+//   Unhealthy : any sustained 403 band (auth or network policy is breaking),
+//               any 206 band (semantic ranker is saturating), or 429 and 503
+//               bands (the service is throttling outright).
+//   Escalate  : 206 sustained above roughly 1 percent of query volume. That
+//               threshold is an engineering recommendation, not a Microsoft
+//               published figure. Tune it against two weeks of baseline.
+//
+// Derived from Q2-SearchByHttpResultCode,
+//   .copilot-tracking/research/2026-09-22/ai-search-scaling-206-403-rca-research.md Lines 293-310
+// =============================================================================
+
+let lookback = 24h;
+let bucket = 5m;
+AzureDiagnostics
+| where TimeGenerated > ago(lookback)
+| where ResourceProvider == "MICROSOFT.SEARCH"
+| where OperationName in ("Query.Search", "Query.Suggest", "Query.Lookup", "Query.Autocomplete")
+| extend StatusCode = toint(resultSignature_d)
+| extend StatusBucket = case(
+      StatusCode == 200, "200 OK",
+      StatusCode == 206, "206 Partial Content (semantic capacity)",   // UNVERIFIED that Search logs 206 - see U6
+      StatusCode == 402, "402 Payment Required (semantic free plan exhausted)",
+      StatusCode == 403, "403 Forbidden (auth / network policy)",
+      StatusCode == 429, "429 Too Many Requests (throttle)",
+      StatusCode == 503, "503 Service Unavailable (throttle)",
+      strcat(tostring(StatusCode), " Other"))
+| summarize Requests = count() by StatusBucket, bin(TimeGenerated, bucket)
+| render timechart with (ytitle = "Search requests by status")
+
+// -----------------------------------------------------------------------------
+// COMPANION A: status rollup with the affected indexes named
+// Use this to answer "which of the seven indexes is failing" in one look.
+// -----------------------------------------------------------------------------
+// let lookback = 7d;
+// AzureDiagnostics
+// | where TimeGenerated > ago(lookback)
+// | where ResourceProvider == "MICROSOFT.SEARCH"
+// | where OperationName in ("Query.Search", "Query.Suggest", "Query.Lookup", "Query.Autocomplete")
+// | extend StatusCode = toint(resultSignature_d)
+// | summarize
+//     Count       = count(),
+//     Indexes     = make_set(IndexName_s, 25),
+//     DistinctIdx = dcount(IndexName_s),
+//     AvgMs       = round(avg(DurationMs), 1),
+//     FirstSeen   = min(TimeGenerated),
+//     LastSeen    = max(TimeGenerated)
+//     by StatusCode, OperationName
+// | order by Count desc
+
+// -----------------------------------------------------------------------------
+// COMPANION B: failure drill-down with the query payload
+// Description_s and Query_s carry the endpoint and the literal query string.
+// Both are documented but neither appears in a published Microsoft sample, so
+// treat their availability as UNVERIFIED until file 01 section 4 confirms it.
+// This is the closest the Search tier gets to answering the customer's
+// "the connector is a black box, we cannot see request payloads" complaint.
+// -----------------------------------------------------------------------------
+// let lookback = 24h;
+// AzureDiagnostics
+// | where TimeGenerated > ago(lookback)
+// | where ResourceProvider == "MICROSOFT.SEARCH"
+// | extend StatusCode = toint(resultSignature_d)
+// | where StatusCode >= 400 or StatusCode == 206
+// | project TimeGenerated, StatusCode, OperationName, IndexName_s, Description_s, Query_s, Documents_d, DurationMs, ResultType
+// | order by TimeGenerated desc
+// | take 100

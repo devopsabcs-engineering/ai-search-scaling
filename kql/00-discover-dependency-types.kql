@@ -1,0 +1,99 @@
+// =============================================================================
+// 00-discover-dependency-types.kql
+// RUN THIS FIRST. Nothing else in this library is safe until it returns rows.
+// =============================================================================
+//
+// PURPOSE
+//   Enumerate the actual (type, name, target) triples that Copilot Studio emits
+//   into Application Insights, so every downstream query can be pinned to the
+//   shape this environment really produces instead of an assumed schema.
+//
+// WHY THIS QUERY EXISTS (open item U8)
+//   The sampled 403 record from this customer looks like:
+//       type       = "Connector"
+//       name       = "Azure AI Search"
+//       target     = "shared_azureaisearch/SemanticHybridSearch"
+//       resultCode = "403"
+//       attributes.DesignMode    = "True"
+//       attributes.channelId     = "pva-studio"
+//       attributes.conversationId
+//   Microsoft's documented Copilot Studio environment-level telemetry schema
+//   publishes something different: type = "GenAI", name = "ExecuteTool", and
+//   custom dimension keys prefixed "gen_ai." (gen_ai.conversation.id,
+//   gen_ai.tool.name, and so on).
+//   The observed shape matches NEITHER documented schema. Until this query is
+//   run, no dashboard, alert, or attribution query built on either naming
+//   convention can be trusted.
+//   Research: .copilot-tracking/research/2026-09-22/ai-search-scaling-206-403-rca-research.md
+//             Line 351 (span-shape mismatch warning), Lines 425-440 (U8)
+//
+// TARGET TABLE
+//   Application Insights `dependencies` (the Copilot Studio telemetry export
+//   target). In this engagement the component is shared across Copilot Studio,
+//   Azure AI Search, and the Functions ingestion pipeline, so expect rows from
+//   more than one producer.
+//
+// PREREQUISITES
+//   * Copilot Studio telemetry export to Application Insights is enabled.
+//   * "Log conversation details" is ON if you also want tool arguments and
+//     results later (not required for this query).
+//   * The Application Insights component does NOT have DisableLocalAuth set.
+//     When it is set, Copilot Studio telemetry export fails SILENTLY and this
+//     query returns zero rows even though the agent is serving traffic.
+//   Enable with: scripts/Enable-DiagnosticSettings.ps1
+//
+// HEALTHY VS UNHEALTHY
+//   Healthy   : rows returned; at least one triple clearly maps to Azure AI
+//               Search; Failures is a small fraction of Calls.
+//   Unhealthy : a Search-related triple where Failures / Calls is material, or
+//               SampleRc shows "403", "206", "429", or "503".
+//   Blocked   : zero rows. Telemetry export is off, DisableLocalAuth is set, or
+//               you are querying the wrong Application Insights component. Fix
+//               that before running anything else in this library.
+//
+// WHAT TO DO WITH THE RESULT
+//   Record the winning (type, name, target) triple. Files 20-23 and 10-12 tell
+//   you which literal values to substitute if yours differ from the observed
+//   shape encoded here.
+//
+// Derived from Q6-0c-DiscoverDependencyTypes,
+//   .copilot-tracking/research/2026-09-22/ai-search-scaling-206-403-rca-research.md Lines 353-361
+// =============================================================================
+
+let lookback = 7d;
+dependencies
+| where timestamp > ago(lookback)
+| summarize
+    Calls     = count(),
+    Failures  = countif(success == false),
+    SampleRc  = take_any(resultCode),
+    ResultCodes = make_set(resultCode, 10),
+    FirstSeen = min(timestamp),
+    LastSeen  = max(timestamp)
+    by type, name, target
+| extend FailurePct = round(100.0 * Failures / Calls, 2)
+| order by Calls desc
+
+// -----------------------------------------------------------------------------
+// COMPANION A: which custom dimension keys actually exist
+// Answers "is it attributes.conversationId or gen_ai.conversation.id here?"
+// Microsoft-published discovery pattern.
+// -----------------------------------------------------------------------------
+// let lookback = 7d;
+// dependencies
+// | where timestamp > ago(lookback)
+// | mv-expand Key = bag_keys(customDimensions) to typeof(string)
+// | summarize
+//     SeenOnSpans = make_set(name, 10),
+//     SampleValue = take_any(tostring(customDimensions[Key]))
+//     by Key
+// | order by Key asc
+
+// -----------------------------------------------------------------------------
+// COMPANION B: full column list for the dependencies table
+// Use when a column referenced in a downstream query errors as unknown.
+// -----------------------------------------------------------------------------
+// dependencies
+// | getschema
+// | project ColumnName, ColumnType
+// | order by ColumnName asc

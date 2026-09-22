@@ -1,0 +1,143 @@
+// =============================================================================
+// 23-design-mode-vs-published.kql
+// THE ZERO-SETUP 30-SECOND FIRST CHECK. Run this before anything else if the
+// Copilot Studio telemetry export is already on.
+// =============================================================================
+//
+// RUN THE DISCOVERY QUERIES FIRST
+//   00-discover-dependency-types.kql confirms the live span shape and the custom
+//   dimension key names. The literals below come from the sampled customer
+//   record and are UNVERIFIED against Microsoft documentation. If file 00 reports
+//   different keys, substitute them.
+//   That said, this query needs no diagnostic settings beyond the Copilot Studio
+//   telemetry export that already produced the sampled record, which is why it
+//   is the cheapest check in the library.
+//
+// PURPOSE
+//   Split the 403s by whether they originated in the Copilot Studio authoring
+//   test canvas or in a published channel, and report what percentage came from
+//   each.
+//
+// WHY THIS QUESTION COMES FIRST
+//   The sampled 403 carries:
+//       attributes.DesignMode = "True"
+//       attributes.channelId  = "pva-studio"
+//       user_Id               = "pva-studio89450329-..."
+//   All three say the same thing: that specific failure happened while a maker
+//   was testing inside the authoring canvas, not while an end user was talking
+//   to the published agent. If that holds across the whole population of 613,
+//   then production is not affected, the severity of the incident drops sharply,
+//   and the investigation narrows to maker-scoped causes. The connector's key
+//   and OAuth connection modes are documented as not shareable, so each maker
+//   gets their own connection instance, and a single broken or duplicate
+//   connection at the environment level produces exactly this pattern.
+//   If instead the 403s are mostly DesignMode "False", production users are
+//   being failed and the incident is live.
+//   Research: .copilot-tracking/research/2026-09-22/ai-search-scaling-206-403-rca-research.md
+//             Lines 142-163 (D6 hypothesis 5, multiple connection instances,
+//             and the DesignMode check named as the no-setup first diagnostic)
+//
+// TARGET TABLE
+//   Application Insights dependencies.
+//
+// PREREQUISITES
+//   * Copilot Studio telemetry export to Application Insights enabled.
+//   * The Application Insights component must not have DisableLocalAuth set, or
+//     the export fails silently and this returns zero rows.
+//   Enable with: scripts/Enable-DiagnosticSettings.ps1
+//
+// HEALTHY VS UNHEALTHY
+//   Best case  : DesignModePct near 100. Production is unaffected. Investigate
+//                the maker connections and treat severity accordingly.
+//   Worst case : DesignModePct near 0. Real users are being failed. Escalate and
+//                go straight to 20-apim-403-triage.kql.
+//   Mixed      : both populations affected, which points at a service-wide cause
+//                such as the IP firewall or an APIM policy rather than at a
+//                per-maker connection.
+//
+// A CAVEAT ON FILTERING TEST TRAFFIC GENERALLY
+//   Every production KPI and every alert built on this telemetry should exclude
+//   test traffic, or maker testing inflates volume and error rates and pages the
+//   on-call for nothing. Use the filter this query establishes.
+// =============================================================================
+
+let lookback = 7d;
+dependencies
+| where timestamp > ago(lookback)
+| where type == "Connector"                  // UNVERIFIED, from the sampled record
+| where name == "Azure AI Search"            // UNVERIFIED, from the sampled record
+| extend
+    DesignMode = tostring(customDimensions["attributes.DesignMode"]),   // UNVERIFIED
+    ChannelId  = tostring(customDimensions["attributes.channelId"])     // UNVERIFIED
+| extend Origin = case(
+      DesignMode =~ "True",  "Authoring test canvas (DesignMode True)",
+      DesignMode =~ "False", "Published channel (DesignMode False)",
+      isempty(DesignMode),   "Unattributed (DesignMode absent)",
+      strcat("Other: ", DesignMode))
+| summarize
+    Calls     = count(),
+    Forbidden = countif(resultCode == "403"),
+    Succeeded = countif(success == true),
+    Channels  = make_set(ChannelId, 10),
+    FirstSeen = min(timestamp),
+    LastSeen  = max(timestamp)
+    by Origin
+| extend ForbiddenPctOfOrigin = round(100.0 * Forbidden / Calls, 2)
+| extend ShareOfAll403 = round(100.0 * Forbidden / toscalar(
+      dependencies
+      | where timestamp > ago(lookback)
+      | where type == "Connector" and name == "Azure AI Search"
+      | where resultCode == "403"
+      | count), 2)
+| project Origin, Calls, Forbidden, Succeeded, ForbiddenPctOfOrigin, ShareOfAll403, Channels, FirstSeen, LastSeen
+| order by Forbidden desc
+
+// -----------------------------------------------------------------------------
+// COMPANION A: the same split over time
+// Shows whether test-canvas and published traffic fail together, which would
+// indicate a shared cause, or independently, which would not.
+// -----------------------------------------------------------------------------
+// let lookback = 7d;
+// dependencies
+// | where timestamp > ago(lookback)
+// | where type == "Connector" and name == "Azure AI Search"
+// | where resultCode == "403"
+// | extend DesignMode = tostring(customDimensions["attributes.DesignMode"])
+// | extend Origin = iff(DesignMode =~ "True", "Test canvas", "Published channel")
+// | summarize Forbidden = count() by Origin, bin(timestamp, 1h)
+// | render timechart with (ytitle = "403s by origin")
+
+// -----------------------------------------------------------------------------
+// COMPANION B: documented-schema fallback on dependencies
+// Microsoft documents no designMode key on dependencies. The closest documented
+// equivalent is microsoft.channel.name, which takes the value
+// "Copilot Studio Test Pane" for test traffic. Treat that exact string as
+// UNVERIFIED as an exhaustive test-traffic filter: it is published as a sample
+// value, not as a guaranteed enumeration.
+// -----------------------------------------------------------------------------
+// let lookback = 7d;
+// dependencies
+// | where timestamp > ago(lookback)
+// | extend ChannelName = tostring(customDimensions["microsoft.channel.name"])
+// | extend Origin = iff(ChannelName == "Copilot Studio Test Pane", "Test pane", "Published channel")
+// | summarize
+//     Calls     = count(),
+//     Failures  = countif(success == false or resultCode == "ERROR"),
+//     Channels  = make_set(ChannelName, 10)
+//     by Origin, name
+// | extend FailurePct = round(100.0 * Failures / Calls, 2)
+// | order by Failures desc
+
+// -----------------------------------------------------------------------------
+// COMPANION C: agent-level telemetry variant
+// Agent-level telemetry writes to customEvents, where designMode is a documented
+// custom dimension with values True and False. This is the verified, published
+// pattern. It only applies if agent-level telemetry is configured in addition to
+// the environment-level export.
+// -----------------------------------------------------------------------------
+// let lookback = 7d;
+// customEvents
+// | where timestamp > ago(lookback)
+// | extend isDesignMode = tostring(customDimensions["designMode"])
+// | summarize Events = count() by isDesignMode, name
+// | order by Events desc

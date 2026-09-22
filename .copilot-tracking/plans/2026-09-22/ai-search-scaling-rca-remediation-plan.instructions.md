@@ -57,101 +57,101 @@ Build a customer-facing advisory package that explains the 206 semantic partial 
 
 `parallelizable` means **safe to author concurrently**. Dependencies that name a diagnostic setting or a customer environment are runtime prerequisites for running a deliverable, not authoring gates.
 
-### [ ] Implementation Phase 1: RCA Advisory Documents
+### [x] Implementation Phase 1: RCA Advisory Documents
 
 <!-- parallelizable: true -->
 
-* [ ] Step 1.1: Author the 206 partial-response RCA document
+* [x] Step 1.1: Author the 206 partial-response RCA document
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 23-71)
-* [ ] Step 1.2: Author the 403 connector triage document
+* [x] Step 1.2: Author the 403 connector triage document
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 72-109)
-* [ ] Step 1.3: Author the Copilot Studio fan-out explainer
+* [x] Step 1.3: Author the Copilot Studio fan-out explainer
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 110-146)
-* [ ] Step 1.4: Validate phase changes
+* [x] Step 1.4: Validate phase changes
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 147-154)
 
-### [ ] Implementation Phase 2: Diagnostic and Evidence-Collection Scripts
+### [x] Implementation Phase 2: Diagnostic and Evidence-Collection Scripts
 
 <!-- parallelizable: true -->
 
-* [ ] Step 2.1: Create the Azure AI Search diagnostic script
+* [x] Step 2.1: Create the Azure AI Search diagnostic script
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 159-199)
-* [ ] Step 2.2: Create the APIM and network policy audit script
+* [x] Step 2.2: Create the APIM and network policy audit script
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 200-238)
-* [ ] Step 2.3: Create the telemetry enablement script
+* [x] Step 2.3: Create the telemetry enablement script
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 239-277)
-* [ ] Step 2.4: Validate phase changes
+* [x] Step 2.4: Validate phase changes
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 278-285)
 
-### [ ] Implementation Phase 3: KQL Query Library
+### [x] Implementation Phase 3: KQL Query Library
 
 <!-- parallelizable: true -->
 
-* [ ] Step 3.1: Create the discovery queries
+* [x] Step 3.1: Create the discovery queries
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 292-321)
-* [ ] Step 3.2: Create the fan-out and capacity queries
+* [x] Step 3.2: Create the fan-out and capacity queries
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 322-352)
-* [ ] Step 3.3: Create the 403 and 206 attribution queries
+* [x] Step 3.3: Create the 403 and 206 attribution queries
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 353-385)
-* [ ] Step 3.4: Write the KQL library index
+* [x] Step 3.4: Write the KQL library index
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 386-402)
-* [ ] Step 3.5: Validate phase changes
+* [x] Step 3.5: Validate phase changes
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 403-408)
 
-### [ ] Implementation Phase 4: Workbooks and Alert Rules
+### [x] Implementation Phase 4: Workbooks and Alert Rules
 
 <!-- parallelizable: false -->
 
 Sequential after Phase 3 — Steps 4.2 and 4.3 consume the query text authored in Phase 3 and must match it exactly so the two cannot drift. Step 4.1 alone is independent and may start earlier.
 
-* [ ] Step 4.1: Write the workbook import guide
+* [x] Step 4.1: Write the workbook import guide
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 415-448)
-* [ ] Step 4.2: Author the Azure AI Search semantic-capacity workbook
+* [x] Step 4.2: Author the Azure AI Search semantic-capacity workbook
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 449-482)
-* [ ] Step 4.3: Define the alert rules
+* [x] Step 4.3: Define the alert rules
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 483-524)
-* [ ] Step 4.4: Validate phase changes
+* [x] Step 4.4: Validate phase changes
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 525-531)
 
-### [ ] Implementation Phase 5: Remediation and Architecture Guidance
+### [x] Implementation Phase 5: Remediation and Architecture Guidance
 
 <!-- parallelizable: true -->
 
 Parallel with Phase 1. Terminology consistency with Step 1.3 is maintained through a shared anchor in the research document rather than through ordering; lint scopes are per-file so the two phases do not lint each other's in-progress work.
 
-* [ ] Step 5.1: Author the immediate mitigations document
+* [x] Step 5.1: Author the immediate mitigations document
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 538-579)
-* [ ] Step 5.2: Author the fan-out reduction architecture document
+* [x] Step 5.2: Author the fan-out reduction architecture document
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 580-632)
-* [ ] Step 5.3: Validate phase changes
+* [x] Step 5.3: Validate phase changes
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 633-640)
 
-### [ ] Implementation Phase 6: CSS Escalation Packages
+### [x] Implementation Phase 6: CSS Escalation Packages
 
 <!-- parallelizable: false -->
 
-* [ ] Step 6.1: Write the escalation decision guide
+* [x] Step 6.1: Write the escalation decision guide
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 645-679)
-* [ ] Step 6.2: Draft the Azure AI Search support ticket
+* [x] Step 6.2: Draft the Azure AI Search support ticket
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 680-725)
-* [ ] Step 6.3: Draft the Copilot Studio and APIM support tickets
+* [x] Step 6.3: Draft the Copilot Studio and APIM support tickets
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 726-756)
-* [ ] Step 6.4: Validate phase changes
+* [x] Step 6.4: Validate phase changes
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 757-762)
 
-### [ ] Implementation Phase 7: Customer Questions, Open Items, and Repository Index
+### [x] Implementation Phase 7: Customer Questions, Open Items, and Repository Index
 
 <!-- parallelizable: false -->
 
-* [ ] Step 7.1: Write the customer questions and open items documents
+* [x] Step 7.1: Write the customer questions and open items documents
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 767-795)
-* [ ] Step 7.2: Rewrite the repository README as the package index
+* [x] Step 7.2: Rewrite the repository README as the package index
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 796-819)
-* [ ] Step 7.3: Run full project validation
+* [x] Step 7.3: Run full project validation
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 820-829)
-* [ ] Step 7.4: Fix minor validation issues
+* [x] Step 7.4: Fix minor validation issues
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 830-833)
-* [ ] Step 7.5: Report blocking issues
+* [x] Step 7.5: Report blocking issues
   * Details: .copilot-tracking/details/2026-09-22/ai-search-scaling-rca-remediation-details.md (Lines 834-842)
 
 ## Planning Log

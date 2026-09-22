@@ -1,0 +1,159 @@
+// =============================================================================
+// 12-semantic-capacity-headroom.kql
+// Estimated concurrent semantic requests against the computed in-flight ceiling.
+// =============================================================================
+//
+// RUN THE DISCOVERY QUERIES FIRST
+//   00-discover-dependency-types.kql and 01-discover-search-diagnostic-shape.kql.
+//   Section 4 of file 01 decides whether the semantic-query filter below can be
+//   applied at all. If Query_s is empty in your workspace, use the fallback in
+//   COMPANION A, which counts all query operations and therefore overstates
+//   semantic load.
+//
+// PURPOSE
+//   Estimate how many Search requests were in flight concurrently in each time
+//   bucket, and compare that estimate to the semantic ranker admission-control
+//   ceiling for the service tier and search-unit count configured below.
+//
+// THE CEILING, AND WHY 6 IS THE NUMBER THAT MATTERS
+//   Azure AI Search runs the semantic ranker behind a queue. Per search unit
+//   (search units = replicas x partitions) the published limits are:
+//
+//     Tier     Max concurrent    Max queue    In flight before rejection
+//     Basic          2               4                    6
+//     S1             3               6                    9
+//     S2             4               8                   12
+//     S3             4               8                   12
+//
+//   When the concurrent limit is reached the service queues. When the queue is
+//   full it rejects, and the caller sees 206 Partial Content carrying
+//   @search.semanticPartialResponseReason.
+//   On Basic at one search unit the ceiling is 6 in flight. The agent issues 7
+//   concurrent semantic requests per user turn, one per knowledge source. A
+//   single turn exceeds the ceiling before a second user arrives. That is the
+//   strongest supported explanation for the 206s, and it explains why moving to
+//   S1 helped so much: the ceiling moved from 6 to 9 per search unit.
+//   It is the strongest supported explanation, not a confirmed cause. See the
+//   caveats below.
+//   Research: .copilot-tracking/research/2026-09-22/ai-search-scaling-206-403-rca-research.md
+//             Lines 80-102 (D1, the limits table), Lines 103-116 (D2)
+//
+// TWO CAVEATS THAT MUST TRAVEL WITH THIS QUERY
+//   1. Documentation conflict (open item U4). The service-limits page states
+//      2 or 3 concurrent per SEARCH UNIT plus queue. The semantic ranking
+//      how-to states 10 concurrent per REPLICA. Different magnitudes, different
+//      units. They cannot both be literal. This query implements the limits
+//      table. Raise the conflict with Microsoft support.
+//   2. The concurrency estimate below applies Little's law
+//      (concurrency = throughput x mean service time). It is an inference from
+//      the logs, not a counter Microsoft publishes. Treat it as an indicator of
+//      pressure, not as a measurement of the queue depth.
+//
+// TARGET TABLE
+//   AzureDiagnostics, ResourceProvider == "MICROSOFT.SEARCH".
+//
+// PREREQUISITES
+//   * Search diagnostic setting sending OperationLogs to this workspace.
+//   * Confirm the live replica and partition counts and set searchUnits below.
+//   * Confirm properties.semanticSearch is "standard" and not "free" before
+//     reading anything into this chart. The free plan allows 1,000 semantic
+//     requests per month, which this workload consumes in days, and exhaustion
+//     produces a billing error rather than a capacity signal.
+//   Collect both with: scripts/Get-SearchServiceDiagnostics.ps1
+//   Enable logging with: scripts/Enable-DiagnosticSettings.ps1
+//
+// HEALTHY VS UNHEALTHY
+//   Healthy   : HeadroomPct stays comfortably positive and EstConcurrency sits
+//               well below InFlightCapacity across the peak hour.
+//   Unhealthy : EstConcurrency touches or crosses InFlightCapacity. Expect 206s
+//               in the same buckets. Correlate against file 11 or file 21.
+//   Action    : sustained saturation means either more search units, fewer
+//               indexes per turn, or a provisioning request to Microsoft.
+//               Microsoft documents the support ticket explicitly for workloads
+//               at or above the semantic ranking ceiling.
+//
+// SIZING RULE OF THUMB
+//   Size search units against ceil(7 x peak_concurrent_turns / 9) on S1, not
+//   against average queries per second. Averages hide the per-turn burst.
+// =============================================================================
+
+// --- Tier parameters: edit these three to match the live service -------------
+let lookback = 24h;
+let bucket = 1m;
+let searchUnits = 1;            // replicas x partitions at the time of the window
+let maxConcurrentPerSu = 2;     // Basic = 2, S1 = 3, S2 = 4, S3 = 4
+let maxQueuePerSu = 4;          // Basic = 4, S1 = 6, S2 = 8, S3 = 8
+let inFlightCapacity = searchUnits * (maxConcurrentPerSu + maxQueuePerSu);
+AzureDiagnostics
+| where TimeGenerated > ago(lookback)
+| where ResourceProvider == "MICROSOFT.SEARCH"
+| where OperationName == "Query.Search"
+// Semantic-only filter. Query_s is documented but UNVERIFIED in practice, so
+// this predicate is the part most likely to need adjustment after file 01.
+| where Query_s has "queryType=semantic" or Query_s has "semanticConfiguration"
+| summarize
+    Requests      = count(),
+    AvgMs         = avg(DurationMs),
+    P95Ms         = round(percentile(DurationMs, 95), 1),
+    DistinctIdx   = dcount(IndexName_s)
+    by bin(TimeGenerated, bucket)
+// Little's law: concurrency = arrival rate x mean service time.
+// The divisor 60.0 is the bucket width in seconds and must track the `bucket` value above.
+| extend RequestsPerSec = Requests / 60.0
+| extend EstConcurrency = round(RequestsPerSec * (AvgMs / 1000.0), 2)
+| extend
+    InFlightCapacity = inFlightCapacity,
+    HeadroomPct      = round(100.0 * (inFlightCapacity - EstConcurrency) / inFlightCapacity, 1)
+| project TimeGenerated, Requests, DistinctIdx, AvgMs = round(AvgMs, 1), P95Ms, EstConcurrency, InFlightCapacity, HeadroomPct
+| render timechart with (ytitle = "Estimated concurrent semantic requests vs ceiling")
+
+// -----------------------------------------------------------------------------
+// COMPANION A: fallback when Query_s is empty
+// Counts every query operation instead of semantic ones only. This OVERSTATES
+// semantic load whenever the workload also issues non-semantic queries, so read
+// the result as an upper bound.
+// -----------------------------------------------------------------------------
+// let lookback = 24h;
+// let searchUnits = 1;
+// let inFlightCapacity = searchUnits * (2 + 4);   // Basic
+// AzureDiagnostics
+// | where TimeGenerated > ago(lookback)
+// | where ResourceProvider == "MICROSOFT.SEARCH"
+// | where OperationName in ("Query.Search", "Query.Suggest", "Query.Lookup", "Query.Autocomplete")
+// | summarize Requests = count(), AvgMs = avg(DurationMs) by bin(TimeGenerated, 1m)
+// | extend EstConcurrency = round((Requests / 60.0) * (AvgMs / 1000.0), 2)
+// | extend InFlightCapacity = inFlightCapacity
+// | project TimeGenerated, Requests, EstConcurrency, InFlightCapacity
+// | render timechart
+
+// -----------------------------------------------------------------------------
+// COMPANION B: the capacity-pressure triplet from platform metrics
+// Throttle percentage, queries per second, and latency on one chart. This is
+// the authoritative throttle signal; the resource log is the diagnosable one.
+// Requires AllMetrics on the Search diagnostic setting.
+// -----------------------------------------------------------------------------
+// let lookback = 24h;
+// AzureMetrics
+// | where TimeGenerated > ago(lookback)
+// | where ResourceProvider == "MICROSOFT.SEARCH"
+// | where MetricName in ("ThrottledSearchQueriesPercentage", "SearchQueriesPerSecond", "SearchLatency")
+// | summarize Value = avg(Average) by MetricName, bin(TimeGenerated, 5m)
+// | evaluate pivot(MetricName, any(Value))
+// | render timechart
+
+// -----------------------------------------------------------------------------
+// COMPANION C: does ingestion collide with query time?
+// The ingestion pipeline and the agent share the same search units. Indexing
+// operations landing in the same buckets as degraded query latency is a second,
+// independent capacity story worth ruling in or out.
+// -----------------------------------------------------------------------------
+// let lookback = 24h;
+// AzureDiagnostics
+// | where TimeGenerated > ago(lookback)
+// | where ResourceProvider == "MICROSOFT.SEARCH"
+// | summarize
+//     IndexingOps = countif(OperationName startswith "Indexing." or OperationName startswith "Indexers."),
+//     QueryOps    = countif(OperationName in ("Query.Search", "Query.Suggest", "Query.Lookup", "Query.Autocomplete")),
+//     QueryP95Ms  = round(percentile(DurationMs, 95), 1)
+//     by bin(TimeGenerated, 5m)
+// | render timechart with (ytitle = "Indexing vs query operations and query p95")

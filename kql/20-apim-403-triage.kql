@@ -1,0 +1,150 @@
+// =============================================================================
+// 20-apim-403-triage.kql
+// The highest-value single diagnostic in this package.
+// Answers one question: did APIM reject the request, or did Azure AI Search?
+// =============================================================================
+//
+// RUN THE DISCOVERY QUERIES FIRST
+//   00-discover-dependency-types.kql and 01-discover-search-diagnostic-shape.kql.
+//   This query itself uses only verified ApiManagementGatewayLogs columns, so it
+//   is the most schema-stable file in the library, but the discovery results
+//   tell you which correlation keys are available for the follow-up drill-down.
+//
+// PURPOSE
+//   Attribute every 403 seen in the APIM gateway logs to one of three origins,
+//   then group the result by the APIM error metadata so the specific policy or
+//   backend failure is named rather than guessed.
+//
+// THE DISTINCTION THAT MAKES THIS QUERY WORK
+//   ResponseCode        is what APIM returned TO Copilot Studio.
+//   BackendResponseCode is what Azure AI Search returned TO APIM.
+//   Divergence between the two is the definitive attribution:
+//     BackendResponseCode == 403
+//         Search itself rejected the call. This is an authorization or network
+//         policy denial: a missing or scoped-out RBAC assignment, key-based auth
+//         disabled, or an IP firewall allow-list that no longer covers the
+//         connector egress prefixes. Azure AI Search does NOT return 403 for
+//         quota and does NOT return 403 for storage exhaustion, so those
+//         explanations are off the table.
+//     ResponseCode == 403 with no backend code
+//         APIM short-circuited before ever calling Search. The only APIM
+//         throttling policy that returns 403 is quota or quota-by-key;
+//         rate-limit returns 429. An ip-filter denial also lands here, as does
+//         a validate-jwt or check-header rejection. A missing or invalid APIM
+//         subscription key returns 401, not 403, which rules that out.
+//     Both set but different
+//         APIM rewrote the status, so read LastErrorSource before concluding
+//         anything about the backend.
+//   Branching on this collapses roughly thirteen candidate causes to about four.
+//   Research: .copilot-tracking/research/2026-09-22/ai-search-scaling-206-403-rca-research.md
+//             Lines 312-336 (Q8c and the ResponseCode explanation),
+//             Lines 142-163 (D6 ranked hypotheses 1 through 5)
+//
+// TARGET TABLE
+//   ApiManagementGatewayLogs. All columns used below are verified against the
+//   published table reference.
+//
+// PREREQUISITES
+//   * The GatewayLogs diagnostic category enabled on the APIM service and sent
+//     to this Log Analytics workspace.
+//   * APIM must NOT be on the Consumption tier. Consumption supports no resource
+//     logs at all, which would invalidate this entire diagnostic path. Confirm
+//     the tier before planning around gateway logs (open item U9).
+//   Enable with: scripts/Enable-DiagnosticSettings.ps1
+//   Audit policies with: scripts/Get-ApimPolicyAudit.ps1
+//
+// HEALTHY VS UNHEALTHY
+//   Healthy   : zero rows over the window.
+//   Result A  : "403 from Azure AI Search backend" dominates. Go to Search-side
+//               authorization: check networkRuleSet.ipRules against the current
+//               AzureConnectors service tags for the region, check RBAC role
+//               assignments per index, and check whether key-based auth is
+//               disabled. Then run 22-connector-403-by-index.kql.
+//   Result B  : "403 raised by APIM policy" dominates. Go to the policy XML at
+//               all four scopes and look for quota, quota-by-key, and ip-filter.
+//               LastErrorReason usually names it outright: CallerIpNotAllowed,
+//               CallerIpBlocked, or a quota message.
+//   Result C  : mixed. Two independent causes are running concurrently. Split
+//               the investigation by Origin403 and treat them separately.
+//
+// Derived from Q8c-Apim403Triage,
+//   .copilot-tracking/research/2026-09-22/ai-search-scaling-206-403-rca-research.md Lines 314-334
+// =============================================================================
+
+let lookback = 7d;
+ApiManagementGatewayLogs
+| where TimeGenerated > ago(lookback)
+| where ResponseCode == 403 or BackendResponseCode == 403
+| extend Origin403 = case(
+      BackendResponseCode == 403, "403 from Azure AI Search backend",
+      ResponseCode == 403 and (isnull(BackendResponseCode) or BackendResponseCode == 0), "403 raised by APIM policy",
+      "403 rewritten by APIM")
+| summarize
+    Count         = count(),
+    FirstSeen     = min(TimeGenerated),
+    LastSeen      = max(TimeGenerated),
+    Apis          = make_set(ApiId, 10),
+    Operations    = make_set(OperationName, 10),
+    Subscriptions = make_set(ApimSubscriptionId, 10),
+    CallerIps     = make_set(CallerIpAddress, 10),
+    SampleBackend = take_any(BackendUrl),
+    SampleMessage = take_any(LastErrorMessage)
+    by Origin403, LastErrorSource, LastErrorReason, LastErrorScope, LastErrorSection
+| order by Count desc
+
+// -----------------------------------------------------------------------------
+// COMPANION A: the full outcome attribution, not just 403
+// Run this when the 403 picture is clean but calls are still failing. It catches
+// APIM post-processing failures, where the backend succeeded and APIM still
+// returned an error.
+// -----------------------------------------------------------------------------
+// let lookback = 24h;
+// ApiManagementGatewayLogs
+// | where TimeGenerated > ago(lookback)
+// | where ResponseCode >= 400 or BackendResponseCode >= 400 or IsRequestSuccess == false
+// | extend Attribution = case(
+//       ResponseCode >= 400 and (isnull(BackendResponseCode) or BackendResponseCode == 0), "APIM-generated (no backend call)",
+//       BackendResponseCode >= 400 and ResponseCode == BackendResponseCode,                "Backend error (passed through)",
+//       BackendResponseCode >= 400 and ResponseCode != BackendResponseCode,                "Backend error (rewritten by APIM)",
+//       BackendResponseCode  < 400 and ResponseCode >= 400,                                "APIM post-processing failure",
+//       "Other")
+// | summarize
+//     Requests       = count(),
+//     DistinctApis   = dcount(ApiId),
+//     AvgBackendMs   = round(avg(BackendTime), 1),
+//     P95TotalMs     = round(percentile(TotalTime, 95), 1),
+//     SampleErrorMsg = take_any(LastErrorMessage)
+//     by Attribution, ResponseCode, BackendResponseCode, LastErrorSource, LastErrorReason
+// | order by Requests desc
+
+// -----------------------------------------------------------------------------
+// COMPANION B: attribution over time
+// Shows whether the 403s are a continuous condition or a burst that correlates
+// with load. Bursty and load-correlated points at an APIM quota policy; flat and
+// continuous points at a firewall or RBAC change.
+// -----------------------------------------------------------------------------
+// let lookback = 7d;
+// ApiManagementGatewayLogs
+// | where TimeGenerated > ago(lookback)
+// | extend Attribution = case(
+//       ResponseCode < 400 and (BackendResponseCode < 400 or isnull(BackendResponseCode)), "Success",
+//       ResponseCode >= 400 and (isnull(BackendResponseCode) or BackendResponseCode == 0),  "APIM-generated",
+//       BackendResponseCode >= 400,                                                         "Backend (Azure AI Search)",
+//       "APIM post-processing")
+// | summarize Requests = count() by Attribution, bin(TimeGenerated, 5m)
+// | render timechart with (title = "APIM request outcome attribution")
+
+// -----------------------------------------------------------------------------
+// COMPANION C: raw rows for correlation
+// CorrelationId is the candidate join key back to the Copilot Studio connector
+// span. It is UNVERIFIED that APIM propagates it to or from that span, so run
+// this to test whether the identifiers ever line up before designing around it.
+// -----------------------------------------------------------------------------
+// let lookback = 24h;
+// ApiManagementGatewayLogs
+// | where TimeGenerated > ago(lookback)
+// | where ResponseCode == 403 or BackendResponseCode == 403
+// | project TimeGenerated, CorrelationId, ApiId, OperationName, ResponseCode, BackendResponseCode,
+//           LastErrorSource, LastErrorReason, LastErrorMessage, CallerIpAddress, BackendUrl, TotalTime, BackendTime
+// | order by TimeGenerated desc
+// | take 100

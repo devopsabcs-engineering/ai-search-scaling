@@ -1,0 +1,141 @@
+// =============================================================================
+// 21-apim-206-semantic-partial-capture.kql
+// The only mechanism anywhere in Azure Monitor that recovers the 206 reason.
+// =============================================================================
+//
+// RUN THE DISCOVERY QUERIES FIRST
+//   00-discover-dependency-types.kql and 01-discover-search-diagnostic-shape.kql.
+//   File 01 section 3 tells you whether the Search resource log sees 206 at all;
+//   this file is the fallback when it does not, and the reason-level detail even
+//   when it does.
+//
+// PURPOSE
+//   Extract @search.semanticPartialResponseReason from the captured response
+//   body on every 206 crossing the APIM gateway, and report the distribution of
+//   reasons over time.
+//
+// PREREQUISITES, AND ONE OF THEM IS HARD. READ THIS BEFORE RUNNING.
+//   This query returns nothing useful unless RESPONSE-BODY LOGGING is enabled on
+//   the APIM GatewayLogs diagnostic setting. BackendResponseBody and ResponseBody
+//   are empty by default. Bodies are truncated to the configured byte limit, so
+//   set the limit high enough that the @search.* annotations, which sit near the
+//   start of a Search response, are retained.
+//   Body logging carries privacy and DLP implications. Get that reviewed before
+//   turning it on in production.
+//   Enable with: scripts/Enable-DiagnosticSettings.ps1
+//
+// WHY APIM IS THE ONLY ROUTE
+//   @search.semanticPartialResponseReason is NOT in the Azure AI Search resource
+//   log schema. The documented Properties sub-schema contains exactly four
+//   fields: Description_s, Documents_d, IndexName_s, Query_s. The reason string
+//   exists only in the HTTP response body returned to the caller. APIM sits in
+//   the path and can capture that body; nothing else in the telemetry chain can.
+//   This is the single strongest argument for keeping APIM in the path.
+//   Research: .copilot-tracking/research/2026-09-22/ai-search-scaling-206-403-rca-research.md
+//             Lines 188-200 (D11 schema limitation), Lines 338-349 (Q8d)
+//
+// WHAT THIS QUERY DECIDES (open items U1 and U2)
+//   U1: the sampled 206 carried reason "Transient". Microsoft documents
+//       "CapacityOverloaded" as the capacity signal and says nothing linking
+//       "Transient" to tier or capacity. If this query shows CapacityOverloaded
+//       in the population, the capacity story is PROVEN. If every row is
+//       Transient, the capacity story remains INFERRED and belongs in the
+//       support ticket as question one.
+//   U2: the semanticErrorHandling parameter defaults to "fail", which returns an
+//       error rather than a 206. Something in the path is setting it to
+//       "partial", and the built-in connector does not expose it. Inspecting the
+//       captured REQUEST body identifies who sets it. See COMPANION B.
+//
+// TARGET TABLE
+//   ApiManagementGatewayLogs.
+//
+// UNVERIFIED ASSUMPTION
+//   The extract() pattern below assumes the body literally contains
+//   "semanticPartialResponseReason":"<value>". Microsoft documents the phrases
+//   but does not publish the exact JSON body shape. Capture one real body with
+//   COMPANION A and adjust the pattern if the serialization differs.
+//
+// HEALTHY VS UNHEALTHY
+//   Healthy   : zero rows.
+//   Unhealthy : any rows at all. Every 206 is a query that returned base results
+//               without semantic re-ranking, which the user experiences as a
+//               worse or empty answer rather than as an error.
+//   Escalate  : Reasons contains "CapacityOverloaded". Microsoft's own guidance
+//               for workloads at that ceiling is to file a support ticket so the
+//               workload can be provisioned for.
+//
+// Derived from Q8d-Apim206SemanticPartialCapture,
+//   .copilot-tracking/research/2026-09-22/ai-search-scaling-206-403-rca-research.md Lines 339-349
+// =============================================================================
+
+let lookback = 24h;
+let bucket = 1h;
+ApiManagementGatewayLogs
+| where TimeGenerated > ago(lookback)
+| where ResponseCode == 206 or BackendResponseCode == 206
+| extend
+    PartialReason = extract(@"semanticPartialResponseReason""\s*:\s*""([^""]+)""", 1, tostring(BackendResponseBody)),
+    PartialType   = extract(@"semanticPartialResponseType""\s*:\s*""([^""]+)""", 1, tostring(BackendResponseBody))
+| summarize
+    Count        = count(),
+    Reasons      = make_set(PartialReason, 10),
+    Types        = make_set(PartialType, 10),
+    Apis         = make_set(ApiId, 10),
+    AvgBackendMs = round(avg(BackendTime), 1),
+    P95BackendMs = round(percentile(BackendTime, 95), 1),
+    FirstSeen    = min(TimeGenerated),
+    LastSeen     = max(TimeGenerated)
+    by bin(TimeGenerated, bucket)
+| order by TimeGenerated desc
+
+// -----------------------------------------------------------------------------
+// COMPANION A: capture one raw body and validate the regex
+// Run this first, once. Read the BodySnippet column and confirm the annotation
+// is serialized the way the main query expects before trusting any aggregate.
+// -----------------------------------------------------------------------------
+// let lookback = 24h;
+// ApiManagementGatewayLogs
+// | where TimeGenerated > ago(lookback)
+// | where ResponseCode == 206 or BackendResponseCode == 206
+// | project TimeGenerated, ApiId, OperationName, ResponseCode, BackendResponseCode, BackendTime,
+//           BodySnippet = substring(tostring(BackendResponseBody), 0, 2000)
+// | order by TimeGenerated desc
+// | take 5
+
+// -----------------------------------------------------------------------------
+// COMPANION B: who is setting semanticErrorHandling to partial? (open item U2)
+// The documented default is "fail". A 206 therefore proves something upstream
+// set it to "partial". This inspects the OUTBOUND request body APIM sent to
+// search.windows.net and also surfaces the effective semanticMaxWaitInMilliseconds,
+// whose value when omitted is undocumented (open item U3).
+// Requires request-body logging in addition to response-body logging.
+// -----------------------------------------------------------------------------
+// let lookback = 24h;
+// ApiManagementGatewayLogs
+// | where TimeGenerated > ago(lookback)
+// | where BackendUrl has "search.windows.net"
+// | extend
+//     ErrorHandling = extract(@"semanticErrorHandling""\s*:\s*""([^""]+)""", 1, tostring(BackendRequestBody)),
+//     MaxWaitMs     = extract(@"semanticMaxWaitInMilliseconds""\s*:\s*(\d+)", 1, tostring(BackendRequestBody)),
+//     QueryType     = extract(@"queryType""\s*:\s*""([^""]+)""", 1, tostring(BackendRequestBody))
+// | summarize Count = count(), SampleRequest = take_any(substring(tostring(BackendRequestBody), 0, 1500))
+//     by ErrorHandling, MaxWaitMs, QueryType, ApiId, OperationName
+// | order by Count desc
+
+// -----------------------------------------------------------------------------
+// COMPANION C: 206 rate over time against total Search-bound traffic
+// Gives the percentage figure to alert on. Any sustained non-zero value is
+// worth investigating; the specific threshold is an engineering judgement
+// because Microsoft publishes none.
+// -----------------------------------------------------------------------------
+// let lookback = 7d;
+// ApiManagementGatewayLogs
+// | where TimeGenerated > ago(lookback)
+// | where BackendUrl has "search.windows.net"
+// | summarize
+//     Total   = count(),
+//     Partial = countif(ResponseCode == 206 or BackendResponseCode == 206)
+//     by bin(TimeGenerated, 15m)
+// | extend PartialPct = round(100.0 * Partial / Total, 2)
+// | project TimeGenerated, Total, Partial, PartialPct
+// | render timechart with (ytitle = "206 partial responses as percent of Search traffic")

@@ -1,0 +1,285 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "## Azure AI Search semantic capacity and 403 attribution\n\nNo Azure AI Search workbook template ships in either Microsoft gallery repository, so this one was authored from the query library in `kql/`. Every tile below carries a comment naming its source file. When a query changes in one place, change it in the other.\n\nSet the parameters before reading anything. The tiles depend on diagnostic settings that may not be enabled: run `scripts/Enable-DiagnosticSettings.ps1` first, then the two discovery queries in `kql/`. A tile with no rows and a tile with a missing diagnostic setting look identical.\n\nThe time range applies to every tile. The fan-out and capacity tiles are usually read at 24 hours; the two 403 attribution tiles default to 7 days in the query library, so widen the picker when working the 403s."
+      },
+      "name": "header"
+    },
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "f1a1c0de-0001-4a00-9000-000000000001",
+            "version": "KqlParameterItem/1.0",
+            "name": "TimeRange",
+            "label": "Time range",
+            "type": 4,
+            "isRequired": true,
+            "value": {
+              "durationMs": 86400000
+            },
+            "typeSettings": {
+              "selectableValues": [
+                {
+                  "durationMs": 3600000
+                },
+                {
+                  "durationMs": 14400000
+                },
+                {
+                  "durationMs": 43200000
+                },
+                {
+                  "durationMs": 86400000
+                },
+                {
+                  "durationMs": 172800000
+                },
+                {
+                  "durationMs": 604800000
+                },
+                {
+                  "durationMs": 2592000000
+                }
+              ],
+              "allowCustom": true
+            }
+          },
+          {
+            "id": "f1a1c0de-0002-4a00-9000-000000000002",
+            "version": "KqlParameterItem/1.0",
+            "name": "Workspace",
+            "label": "Log Analytics workspace",
+            "type": 5,
+            "isRequired": true,
+            "description": "The workspace receiving the Azure AI Search and API Management diagnostic settings.",
+            "typeSettings": {
+              "resourceTypeFilter": {
+                "microsoft.operationalinsights/workspaces": true
+              },
+              "additionalResourceOptions": [],
+              "showDefault": false
+            }
+          },
+          {
+            "id": "f1a1c0de-0003-4a00-9000-000000000003",
+            "version": "KqlParameterItem/1.0",
+            "name": "AppInsights",
+            "label": "Application Insights component",
+            "type": 5,
+            "isRequired": true,
+            "description": "The component receiving the Copilot Studio telemetry export. Shared with Azure AI Search and the Functions ingestion pipeline in this environment.",
+            "typeSettings": {
+              "resourceTypeFilter": {
+                "microsoft.insights/components": true
+              },
+              "additionalResourceOptions": [],
+              "showDefault": false
+            }
+          },
+          {
+            "id": "f1a1c0de-0004-4a00-9000-000000000004",
+            "version": "KqlParameterItem/1.0",
+            "name": "SearchService",
+            "label": "Azure AI Search service",
+            "type": 5,
+            "isRequired": false,
+            "description": "Recorded for context and for metric tiles added later. The log tiles below read AzureDiagnostics from the workspace and filter on ResourceProvider instead.",
+            "typeSettings": {
+              "resourceTypeFilter": {
+                "microsoft.search/searchservices": true
+              },
+              "additionalResourceOptions": [],
+              "showDefault": false
+            }
+          },
+          {
+            "id": "f1a1c0de-0005-4a00-9000-000000000005",
+            "version": "KqlParameterItem/1.0",
+            "name": "ApimService",
+            "label": "API Management instance",
+            "type": 5,
+            "isRequired": false,
+            "description": "The gateway in front of Azure AI Search. Consumption tier emits no resource logs, which blanks the APIM tile entirely.",
+            "typeSettings": {
+              "resourceTypeFilter": {
+                "microsoft.apimanagement/service": true
+              },
+              "additionalResourceOptions": [],
+              "showDefault": false
+            }
+          },
+          {
+            "id": "f1a1c0de-0006-4a00-9000-000000000006",
+            "version": "KqlParameterItem/1.0",
+            "name": "SearchUnits",
+            "label": "Search units (replicas x partitions)",
+            "type": 1,
+            "isRequired": true,
+            "description": "Read the live replica and partition counts with scripts/Get-SearchServiceDiagnostics.ps1.",
+            "value": "1"
+          },
+          {
+            "id": "f1a1c0de-0007-4a00-9000-000000000007",
+            "version": "KqlParameterItem/1.0",
+            "name": "MaxConcurrentPerSu",
+            "label": "Max concurrent semantic requests per search unit",
+            "type": 1,
+            "isRequired": true,
+            "description": "Basic = 2, S1 = 3, S2 = 4, S3 = 4.",
+            "value": "2"
+          },
+          {
+            "id": "f1a1c0de-0008-4a00-9000-000000000008",
+            "version": "KqlParameterItem/1.0",
+            "name": "MaxQueuePerSu",
+            "label": "Max semantic queue depth per search unit",
+            "type": 1,
+            "isRequired": true,
+            "description": "Basic = 4, S1 = 6, S2 = 8, S3 = 8.",
+            "value": "4"
+          }
+        ],
+        "style": "pills",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces"
+      },
+      "name": "parameters"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "### 1. Fan-out ratio over time\n\nHow many Search queries one user turn really produces. The agent has seven knowledge sources attached and Copilot Studio does not route among knowledge sources by description below 25 sources, so every turn is expected to fan out to all seven.\n\nExpected here: `DistinctIndexes` settles at 7 and `QueriesPerIndex` tracks the user-turn rate. After consolidation or a move to Tools, `DistinctIndexes` per turn should drop toward 1 or 2 and `TotalQueries` should fall with it.\n\nSource: `kql/10-fan-out-ratio.kql`"
+      },
+      "name": "text-fan-out"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "// Source: kql/10-fan-out-ratio.kql\n// Only the `let lookback` line is parameterised; the pipeline below is the library query.\nlet lookback = {TimeRange:seconds}s;\nlet bucket = 1m;\nAzureDiagnostics\n| where TimeGenerated > ago(lookback)\n| where ResourceProvider == \"MICROSOFT.SEARCH\"\n| where OperationName == \"Query.Search\"\n| summarize\n    TotalQueries    = count(),\n    DistinctIndexes = dcount(IndexName_s),\n    QueriesPerIndex = round(count() * 1.0 / todouble(dcount(IndexName_s)), 2)\n    by bin(TimeGenerated, bucket)\n| render timechart with (ytitle = \"Queries and distinct indexes per minute\")",
+        "size": 0,
+        "title": "Fan-out ratio: queries and distinct indexes per minute",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "{Workspace}"
+        ],
+        "visualization": "linechart"
+      },
+      "name": "query-fan-out"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "### 2. Search results by HTTP status\n\nThe four failure modes kept separate, because they mean four different things. 206 is the semantic ranker at capacity. 403 is authorization or network policy denial, never quota and never storage. 429 and 503 are outright throttling.\n\nZero 429s is the expected result for this workload rather than evidence against resource constraint: the semantic ranker signals capacity pressure with 206, not with 429.\n\nThe 206 bucket is unverified. No Microsoft sample confirms that Search writes 206 into `resultSignature_d`. If it never populates, tile 5 of `kql/21-apim-206-semantic-partial-capture.kql` is the only route to the 206 reason.\n\nSource: `kql/11-search-by-http-result-code.kql`"
+      },
+      "name": "text-status"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "// Source: kql/11-search-by-http-result-code.kql\n// Only the `let lookback` line is parameterised; the pipeline below is the library query.\nlet lookback = {TimeRange:seconds}s;\nlet bucket = 5m;\nAzureDiagnostics\n| where TimeGenerated > ago(lookback)\n| where ResourceProvider == \"MICROSOFT.SEARCH\"\n| where OperationName in (\"Query.Search\", \"Query.Suggest\", \"Query.Lookup\", \"Query.Autocomplete\")\n| extend StatusCode = toint(resultSignature_d)\n| extend StatusBucket = case(\n      StatusCode == 200, \"200 OK\",\n      StatusCode == 206, \"206 Partial Content (semantic capacity)\",   // UNVERIFIED that Search logs 206 - see U6\n      StatusCode == 402, \"402 Payment Required (semantic free plan exhausted)\",\n      StatusCode == 403, \"403 Forbidden (auth / network policy)\",\n      StatusCode == 429, \"429 Too Many Requests (throttle)\",\n      StatusCode == 503, \"503 Service Unavailable (throttle)\",\n      strcat(tostring(StatusCode), \" Other\"))\n| summarize Requests = count() by StatusBucket, bin(TimeGenerated, bucket)\n| render timechart with (ytitle = \"Search requests by status\")",
+        "size": 0,
+        "title": "Search requests by HTTP status, 206 kept separate",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "{Workspace}"
+        ],
+        "visualization": "linechart"
+      },
+      "name": "query-status"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "### 3. Semantic capacity headroom\n\nEstimated concurrent semantic requests against the computed in-flight ceiling for the configured tier and search-unit count.\n\nAzure AI Search admits semantic ranking requests through a queue sized per search unit. On Basic at one search unit the ceiling is 6 in flight. The agent issues 7 concurrent semantic requests per user turn, one per knowledge source, so a single turn exceeds the ceiling before a second user arrives. That is the strongest supported explanation for the 206s and it explains why moving to S1 helped so much: the ceiling moved from 6 to 9 per search unit.\n\nTwo caveats travel with this tile. The concurrency figure applies Little's law to throughput and mean latency; it is an inference from the logs, not a counter Microsoft publishes. And the service-limits page states 2 or 3 concurrent per search unit plus queue while the semantic ranking how-to states 10 concurrent per replica. This tile implements the limits table. Raise the conflict with Microsoft support.\n\nConfirm `properties.semanticSearch` is `standard` and not `free` before reading anything into this chart. The free plan allows 1,000 semantic requests per month, which this workload consumes in days.\n\nSource: `kql/12-semantic-capacity-headroom.kql`"
+      },
+      "name": "text-capacity"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "// Source: kql/12-semantic-capacity-headroom.kql\n// Only the `let` parameter block is parameterised; the pipeline below is the library query.\nlet lookback = {TimeRange:seconds}s;\nlet bucket = 1m;\nlet searchUnits = {SearchUnits};            // replicas x partitions at the time of the window\nlet maxConcurrentPerSu = {MaxConcurrentPerSu};     // Basic = 2, S1 = 3, S2 = 4, S3 = 4\nlet maxQueuePerSu = {MaxQueuePerSu};          // Basic = 4, S1 = 6, S2 = 8, S3 = 8\nlet inFlightCapacity = searchUnits * (maxConcurrentPerSu + maxQueuePerSu);\nAzureDiagnostics\n| where TimeGenerated > ago(lookback)\n| where ResourceProvider == \"MICROSOFT.SEARCH\"\n| where OperationName == \"Query.Search\"\n// Semantic-only filter. Query_s is documented but UNVERIFIED in practice, so\n// this predicate is the part most likely to need adjustment after file 01.\n| where Query_s has \"queryType=semantic\" or Query_s has \"semanticConfiguration\"\n| summarize\n    Requests      = count(),\n    AvgMs         = avg(DurationMs),\n    P95Ms         = round(percentile(DurationMs, 95), 1),\n    DistinctIdx   = dcount(IndexName_s)\n    by bin(TimeGenerated, bucket)\n// Little's law: concurrency = arrival rate x mean service time.\n// The divisor 60.0 is the bucket width in seconds and must track the `bucket` value above.\n| extend RequestsPerSec = Requests / 60.0\n| extend EstConcurrency = round(RequestsPerSec * (AvgMs / 1000.0), 2)\n| extend\n    InFlightCapacity = inFlightCapacity,\n    HeadroomPct      = round(100.0 * (inFlightCapacity - EstConcurrency) / inFlightCapacity, 1)\n| project TimeGenerated, Requests, DistinctIdx, AvgMs = round(AvgMs, 1), P95Ms, EstConcurrency, InFlightCapacity, HeadroomPct\n| render timechart with (ytitle = \"Estimated concurrent semantic requests vs ceiling\")",
+        "size": 0,
+        "title": "Estimated concurrent semantic requests against the in-flight ceiling",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "{Workspace}"
+        ],
+        "visualization": "linechart"
+      },
+      "name": "query-capacity"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "### 4. 403 attribution: APIM policy against Search backend\n\nThe highest-value single diagnostic in this package. `ResponseCode` is what APIM returned to Copilot Studio; `BackendResponseCode` is what Azure AI Search returned to APIM. Divergence between the two is the definitive attribution, and it collapses roughly thirteen candidate causes to about four.\n\nA backend 403 points at Search authorization: RBAC scoping, key-based auth disabled, or an IP firewall allow-list that no longer covers the current connector egress prefixes. An APIM-originated 403 points at policy, where quota and quota-by-key are the only throttling policies that return 403; rate-limit returns 429, and a missing or invalid subscription key returns 401.\n\nThis tile needs the `GatewayLogs` category on a non-Consumption APIM tier. Consumption emits no resource logs at all.\n\nWiden the time range to 7 days to match the library default for this query.\n\nSource: `kql/20-apim-403-triage.kql`"
+      },
+      "name": "text-403-apim"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "// Source: kql/20-apim-403-triage.kql\n// Only the `let lookback` line is parameterised; the pipeline below is the library query.\n// The library default for this query is 7d. Set the time range accordingly.\nlet lookback = {TimeRange:seconds}s;\nApiManagementGatewayLogs\n| where TimeGenerated > ago(lookback)\n| where ResponseCode == 403 or BackendResponseCode == 403\n| extend Origin403 = case(\n      BackendResponseCode == 403, \"403 from Azure AI Search backend\",\n      ResponseCode == 403 and (isnull(BackendResponseCode) or BackendResponseCode == 0), \"403 raised by APIM policy\",\n      \"403 rewritten by APIM\")\n| summarize\n    Count         = count(),\n    FirstSeen     = min(TimeGenerated),\n    LastSeen      = max(TimeGenerated),\n    Apis          = make_set(ApiId, 10),\n    Operations    = make_set(OperationName, 10),\n    Subscriptions = make_set(ApimSubscriptionId, 10),\n    CallerIps     = make_set(CallerIpAddress, 10),\n    SampleBackend = take_any(BackendUrl),\n    SampleMessage = take_any(LastErrorMessage)\n    by Origin403, LastErrorSource, LastErrorReason, LastErrorScope, LastErrorSection\n| order by Count desc",
+        "size": 0,
+        "title": "403 attribution by origin, APIM policy against Search backend",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "{Workspace}"
+        ],
+        "visualization": "table"
+      },
+      "name": "query-403-apim"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "### 5. Design mode against published channel\n\nThe cheapest check in the package, and the one that sets severity. The sampled 403 carries `attributes.DesignMode = \"True\"` and `attributes.channelId = \"pva-studio\"`, both of which say the failure happened while a maker was testing in the authoring canvas rather than while a customer was using the published agent.\n\nIf that pattern holds across the whole population, production is unaffected and the investigation narrows to maker-scoped connection instances, which the connector documents as not shareable. If it does not hold, real users are being failed.\n\nThe literals below come from the sampled record and are unverified against Microsoft documentation, which publishes a different span shape. Run `kql/00-discover-dependency-types.kql` first and substitute whatever it reports.\n\nEvery production KPI and every alert built on this telemetry should exclude test traffic, or maker testing inflates volume and error rates and pages the on-call for nothing.\n\nWiden the time range to 7 days to match the library default for this query.\n\nSource: `kql/23-design-mode-vs-published.kql`"
+      },
+      "name": "text-design-mode"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "// Source: kql/23-design-mode-vs-published.kql\n// Only the `let lookback` line is parameterised; the pipeline below is the library query.\n// The library default for this query is 7d. Set the time range accordingly.\nlet lookback = {TimeRange:seconds}s;\ndependencies\n| where timestamp > ago(lookback)\n| where type == \"Connector\"                  // UNVERIFIED, from the sampled record\n| where name == \"Azure AI Search\"            // UNVERIFIED, from the sampled record\n| extend\n    DesignMode = tostring(customDimensions[\"attributes.DesignMode\"]),   // UNVERIFIED\n    ChannelId  = tostring(customDimensions[\"attributes.channelId\"])     // UNVERIFIED\n| extend Origin = case(\n      DesignMode =~ \"True\",  \"Authoring test canvas (DesignMode True)\",\n      DesignMode =~ \"False\", \"Published channel (DesignMode False)\",\n      isempty(DesignMode),   \"Unattributed (DesignMode absent)\",\n      strcat(\"Other: \", DesignMode))\n| summarize\n    Calls     = count(),\n    Forbidden = countif(resultCode == \"403\"),\n    Succeeded = countif(success == true),\n    Channels  = make_set(ChannelId, 10),\n    FirstSeen = min(timestamp),\n    LastSeen  = max(timestamp)\n    by Origin\n| extend ForbiddenPctOfOrigin = round(100.0 * Forbidden / Calls, 2)\n| extend ShareOfAll403 = round(100.0 * Forbidden / toscalar(\n      dependencies\n      | where timestamp > ago(lookback)\n      | where type == \"Connector\" and name == \"Azure AI Search\"\n      | where resultCode == \"403\"\n      | count), 2)\n| project Origin, Calls, Forbidden, Succeeded, ForbiddenPctOfOrigin, ShareOfAll403, Channels, FirstSeen, LastSeen\n| order by Forbidden desc",
+        "size": 0,
+        "title": "403 split by authoring canvas against published channel",
+        "timeContextFromParameter": "TimeRange",
+        "queryType": 0,
+        "resourceType": "microsoft.insights/components",
+        "crossComponentResources": [
+          "{AppInsights}"
+        ],
+        "visualization": "table"
+      },
+      "name": "query-design-mode"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "### Reading the whole page together\n\nTile 1 quantifies the multiplier. Tile 3 shows whether that multiplier is colliding with the semantic admission ceiling, and tile 2 shows whether Search itself recorded the resulting 206s. Tiles 4 and 5 belong to a separate workstream: Azure AI Search does not return 403 for quota or for storage, so the tier change that helped the 206s cannot explain the 403s.\n\nA tile returning no rows is not a clean bill of health until the matching diagnostic setting is confirmed enabled. The prerequisite table in `kql/README.md` maps each query to the setting it needs.\n\nNo threshold on this page is a Microsoft-published figure. Collect two weeks of baseline before turning any of them into an alert. The rules in `alerts/alert-rules.md` carry the same caveat."
+      },
+      "name": "footer"
+    }
+  ],
+  "isLocked": false,
+  "fallbackResourceIds": [],
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}

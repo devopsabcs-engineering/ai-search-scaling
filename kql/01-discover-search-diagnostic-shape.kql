@@ -1,0 +1,107 @@
+// =============================================================================
+// 01-discover-search-diagnostic-shape.kql
+// RUN THIS SECOND. Files 10, 11, 12, and 22 all depend on its answer.
+// =============================================================================
+//
+// PURPOSE
+//   Confirm which AzureDiagnostics columns the Azure AI Search service actually
+//   populates in this workspace, and settle empirically whether Search ever
+//   emits 206 into resultSignature_d.
+//
+// WHY THIS QUERY EXISTS (open item U6)
+//   Azure AI Search has NO dedicated Log Analytics table. Its resource logs land
+//   in the shared AzureDiagnostics table alongside every other provider, which
+//   is why every Search query in this library filters on
+//   ResourceProvider == "MICROSOFT.SEARCH".
+//   The documented Properties sub-schema is only Description_s, Documents_d,
+//   IndexName_s, and Query_s. The KQL column names carry type suffixes and
+//   differ from the logical names in the data reference: write resultSignature_d
+//   (lowercase r, _d suffix), not ResultSignature, and DurationMs, not
+//   DurationMS.
+//   Separately, no Microsoft sample confirms that 206 Partial Content ever
+//   reaches resultSignature_d. Half the Search-side 206 tooling depends on that
+//   being true. Section 3 of this query settles it with data.
+//   Research: .copilot-tracking/research/2026-09-22/ai-search-scaling-206-403-rca-research.md
+//             Lines 188-200 (D11 schema limitation), Lines 425-440 (U6)
+//
+// TARGET TABLE
+//   AzureDiagnostics, filtered to ResourceProvider == "MICROSOFT.SEARCH".
+//
+// PREREQUISITES
+//   * A diagnostic setting on the Search service sending OperationLogs (and
+//     ideally AllMetrics) to this Log Analytics workspace.
+//   Enable with: scripts/Enable-DiagnosticSettings.ps1
+//
+// HEALTHY VS UNHEALTHY
+//   Healthy   : section 1 lists resultSignature_d, DurationMs, IndexName_s,
+//               Documents_d, OperationName; section 2 shows all seven indexes;
+//               section 3 shows overwhelmingly 200.
+//   Unhealthy : section 3 shows non-trivial counts of 403, 429, or 503.
+//   Notable   : section 3 shows 206. That CONFIRMS U6 and makes file 11's
+//               206 bucket real rather than speculative. If 206 is absent,
+//               Search-side 206 detection is not viable in this workspace and
+//               file 21 (APIM response-body capture) becomes the only route.
+//   Blocked   : zero rows. The diagnostic setting is missing or points at a
+//               different workspace.
+//
+// Derived from Q0-DiscoverSearchLogSchema / Q0b-DoesSearchEmit206,
+//   .copilot-tracking/research/subagents/2026-09-22/observability-workbooks-kql-research.md Lines 386-412
+// =============================================================================
+
+let lookback = 7d;
+// --- SECTION 1: which columns are actually populated -------------------------
+AzureDiagnostics
+| where TimeGenerated > ago(lookback)
+| where ResourceProvider == "MICROSOFT.SEARCH"
+| getschema
+| project ColumnName, ColumnType
+| order by ColumnName asc
+
+// -----------------------------------------------------------------------------
+// SECTION 2: which operations and which indexes are live
+// Confirms the seven-index fan-out is visible in the logs and shows the exact
+// IndexName_s spellings to reuse in files 10, 11, and 22.
+// -----------------------------------------------------------------------------
+// let lookback = 7d;
+// AzureDiagnostics
+// | where TimeGenerated > ago(lookback)
+// | where ResourceProvider == "MICROSOFT.SEARCH"
+// | summarize
+//     Operations   = count(),
+//     Indexes      = make_set(IndexName_s, 25),
+//     DistinctIdx  = dcount(IndexName_s),
+//     FirstSeen    = min(TimeGenerated),
+//     LastSeen     = max(TimeGenerated)
+//     by OperationName
+// | order by Operations desc
+
+// -----------------------------------------------------------------------------
+// SECTION 3: does Search emit 206? (the U6 decision point)
+// Run this one on its own and read the StatusCode column carefully.
+// -----------------------------------------------------------------------------
+// let lookback = 7d;
+// AzureDiagnostics
+// | where TimeGenerated > ago(lookback)
+// | where ResourceProvider == "MICROSOFT.SEARCH"
+// | extend StatusCode = toint(resultSignature_d)
+// | summarize
+//     Count     = count(),
+//     Indexes   = make_set(IndexName_s, 25),
+//     FirstSeen = min(TimeGenerated),
+//     LastSeen  = max(TimeGenerated)
+//     by StatusCode, OperationName, ResultType
+// | order by Count desc
+
+// -----------------------------------------------------------------------------
+// SECTION 4: is Query_s populated?
+// Query_s is documented but never exercised in a published Microsoft sample.
+// It carries the literal query string, which is the only way to tell a semantic
+// query apart from a plain one in the logs. File 12 depends on it.
+// -----------------------------------------------------------------------------
+// let lookback = 1d;
+// AzureDiagnostics
+// | where TimeGenerated > ago(lookback)
+// | where ResourceProvider == "MICROSOFT.SEARCH"
+// | where OperationName == "Query.Search"
+// | project TimeGenerated, IndexName_s, Query_s, Description_s, Documents_d, DurationMs, resultSignature_d
+// | take 25

@@ -1,0 +1,137 @@
+// =============================================================================
+// 22-connector-403-by-index.kql
+// Tests the per-index RBAC hypothesis: is one of the seven indexes unauthorized?
+// =============================================================================
+//
+// RUN THE DISCOVERY QUERIES FIRST
+//   00-discover-dependency-types.kql and 01-discover-search-diagnostic-shape.kql.
+//   File 00 gives you the live (type, name, target) triple for section 1 below;
+//   file 01 gives you the IndexName_s spellings for section 2. The literals used
+//   here come from the sampled customer record and are UNVERIFIED against any
+//   Microsoft documentation, so substitute whatever file 00 actually reports.
+//
+// PURPOSE
+//   Determine whether the 403s cluster on a subset of the seven indexes. A role
+//   assignment scoped to six of seven indexes looks intermittent in aggregate
+//   and is perfectly deterministic per index, which is exactly the signature the
+//   customer is describing.
+//
+// WHY THIS IS THE CHEAPEST HYPOTHESIS TO DISPROVE
+//   If the 403s are spread evenly across all seven indexes, per-index RBAC is
+//   dead and the investigation moves to the service-wide causes: the IP firewall
+//   allow-list, the APIM quota policy, or a broken connection instance. If they
+//   concentrate on one or two index names, the answer is a role assignment and
+//   the fix takes minutes.
+//   Research: .copilot-tracking/research/2026-09-22/ai-search-scaling-206-403-rca-research.md
+//             Lines 142-163 (D6 hypothesis 4, per-index RBAC scoping)
+//
+// TWO SECTIONS, AND WHY BOTH ARE NEEDED
+//   The connector span does NOT carry the index name. In the sampled record the
+//   target is "shared_azureaisearch/SemanticHybridSearch", which identifies the
+//   connector operation, not the index. So:
+//     Section 1 groups the connector-side 403s by target and conversation to
+//               establish volume, spread, and whether target ever varies.
+//     Section 2 groups the Search-side 403s by IndexName_s. This is the actual
+//               per-index test.
+//   Reading them together also answers a second question. If section 1 shows
+//   hundreds of 403s and section 2 shows none, the requests never reached Search
+//   at all, which points at APIM or the connector rather than at authorization.
+//   That is the same conclusion 20-apim-403-triage.kql reaches from the gateway
+//   side, arrived at independently.
+//
+// TARGET TABLES
+//   Section 1: Application Insights dependencies.
+//   Section 2: AzureDiagnostics, ResourceProvider == "MICROSOFT.SEARCH".
+//
+// PREREQUISITES
+//   * Section 1: Copilot Studio telemetry export to Application Insights.
+//   * Section 2: Search diagnostic setting sending OperationLogs.
+//   Enable both with: scripts/Enable-DiagnosticSettings.ps1
+//
+// HEALTHY VS UNHEALTHY
+//   Healthy    : zero rows in both sections.
+//   Per-index  : section 2 returns 403s concentrated on a subset of index names.
+//                Hypothesis confirmed. Audit the role assignments on those
+//                indexes and compare them against a working one.
+//   Service-wide: section 2 returns 403s spread evenly across all seven. This is
+//                not RBAC scoping. Look at the IP firewall allow-list and
+//                publicNetworkAccess instead.
+//   Never arrived: section 1 returns rows and section 2 returns none. The
+//                rejection happened before Search. Go to 20-apim-403-triage.kql.
+// =============================================================================
+
+// --- SECTION 1: connector-side 403 spread ------------------------------------
+let lookback = 7d;
+dependencies
+| where timestamp > ago(lookback)
+| where type == "Connector"                  // UNVERIFIED, from the sampled record
+| where name == "Azure AI Search"            // UNVERIFIED, from the sampled record
+| where resultCode == "403"
+| extend
+    ConversationId = tostring(customDimensions["attributes.conversationId"]),   // UNVERIFIED
+    ChannelId      = tostring(customDimensions["attributes.channelId"]),        // UNVERIFIED
+    DesignMode     = tostring(customDimensions["attributes.DesignMode"])        // UNVERIFIED
+| summarize
+    Failures              = count(),
+    DistinctConversations = dcount(ConversationId),
+    Channels              = make_set(ChannelId, 10),
+    DesignModes           = make_set(DesignMode, 5),
+    AvgDurationMs         = round(avg(duration), 1),
+    FirstSeen             = min(timestamp),
+    LastSeen              = max(timestamp),
+    SampleOperationId     = take_any(operation_Id)
+    by target
+| order by Failures desc
+
+// -----------------------------------------------------------------------------
+// SECTION 2: Search-side 403 by index. THIS IS THE ACTUAL PER-INDEX TEST.
+// Run this one and read the IndexName_s column. Compare the index list against
+// the full set of seven from file 01 section 2: an index that appears here and
+// nowhere in the success traffic is the smoking gun.
+// -----------------------------------------------------------------------------
+// let lookback = 7d;
+// AzureDiagnostics
+// | where TimeGenerated > ago(lookback)
+// | where ResourceProvider == "MICROSOFT.SEARCH"
+// | extend StatusCode = toint(resultSignature_d)
+// | summarize
+//     Total       = count(),
+//     Forbidden   = countif(StatusCode == 403),
+//     Succeeded   = countif(StatusCode == 200),
+//     FirstDenied = minif(TimeGenerated, StatusCode == 403),
+//     LastDenied  = maxif(TimeGenerated, StatusCode == 403),
+//     SampleQuery = take_anyif(Query_s, StatusCode == 403)
+//     by IndexName_s
+// | extend ForbiddenPct = round(100.0 * Forbidden / Total, 2)
+// | order by Forbidden desc
+
+// -----------------------------------------------------------------------------
+// SECTION 3: documented-schema variant of section 1
+// Use this instead of section 1 if file 00 reports the documented Copilot Studio
+// environment-level shape (type "GenAI", name "ExecuteTool") rather than the
+// observed connector shape. gen_ai.tool.call.arguments carries the request
+// payload and often contains the index name, which makes this variant strictly
+// better than section 1 when it is available.
+// Requires "Log conversation details" to be ON for the arguments to populate.
+// -----------------------------------------------------------------------------
+// let lookback = 7d;
+// dependencies
+// | where timestamp > ago(lookback)
+// | where name == "ExecuteTool"
+// | extend
+//     ToolName      = tostring(customDimensions["gen_ai.tool.name"]),
+//     ToolType      = tostring(customDimensions["gen_ai.tool.type"]),
+//     ToolArguments = tostring(customDimensions["gen_ai.tool.call.arguments"]),
+//     ToolResult    = tostring(customDimensions["gen_ai.tool.call.result"]),
+//     ErrorType     = tostring(customDimensions["error.type"]),
+//     StatusMessage = tostring(customDimensions["Status.message"])
+// | where ToolName has "search" or ToolType has "Search" or ToolName has "azureaisearch"
+// | where resultCode == "ERROR" or success == false
+// | extend IndexHint = extract(@"index[""'\s:=]+([A-Za-z0-9_\-]+)", 1, ToolArguments)
+// | summarize
+//     Failures     = count(),
+//     ErrorTypes   = make_set(ErrorType, 10),
+//     SampleStatus = take_any(StatusMessage),
+//     SampleArgs   = take_any(substring(ToolArguments, 0, 1000))
+//     by ToolName, IndexHint
+// | order by Failures desc
